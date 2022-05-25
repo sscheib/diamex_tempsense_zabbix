@@ -1,30 +1,106 @@
-FROM registry.access.redhat.com/ubi8/ubi
-MAINTAINER Steffen Scheib
-# system preperation
-RUN dnf update -y && dnf -y install libusb hidapi hidapi-devel gcc-c++ make pkgconf-pkg-config zabbix-sender python3-pip
-RUN ln -s /usr/lib64/libusb-1.0.so.0 /usr/lib64/libusb.so
-RUN pip3 install dumb-init
+FROM alpine:3.12
 
-# init
+STOPSIGNAL SIGTERM
+
+# update OS and install some necessary packages
+RUN apk update && apk upgrade
+RUN apk add --no-cache --clean-protected \
+            dumb-init \
+            bash \
+            tzdata \
+            coreutils \
+            iputils \
+            pcre \
+            libcurl \
+            libldap \
+            g++ \
+            libusb \
+            libusb-dev \
+            hidapi-dev 
+
+# install build-dependencies
+RUN apk add --no-cache --virtual build-dependencies \
+            autoconf \
+            automake \
+            curl-dev \
+            openssl-dev \
+            openldap-dev \
+            pcre-dev \
+            make \
+            git \
+            coreutils
+
+# link libusb so ld can find it
+RUN ln -s /usr/lib/libusb-1.0.so /usr/lib/libusb.so
+
+# setup init
 RUN mkdir /init
 ADD containerfiles/init.sh /init/init.sh
 RUN chmod 755 /init/init.sh
 
-# app building
-RUN mkdir /build_dir/
-ADD src/* /build_dir/
-RUN cd /build_dir && make clean && make
-
 # setup /app
-RUN mkdir /app
-RUN mv /build_dir/tempsense /app/tempsense
-RUN chmod 775 /app/tempsense
-# ADD zabbix_agentd.conf /app/zabbix_agentd.conf
+RUN mkdir -p /app/code
+RUN git clone https://github.com/sscheib/diamex_tempsense_zabbix.git /app/code/
+RUN cd /app/code/src/ && make clean && make
+RUN mv /app/code/src/tempsense /app/
+RUN rm -rf /app/code/
+RUN chmod 755 /app/tempsense
 
-# cleanup
-RUN dnf remove -y gcc-c++ make pkgconf-pkg-config
-RUN rm -rf /build_dir/
- 
+
+# build zabbix_sender
+RUN set -eux && \
+    addgroup -S -g 1995 zabbix && \
+    adduser -S \
+            -D -G zabbix -G root \
+            -u 1997 \
+            -h /var/lib/zabbix/ \
+        zabbix && \
+    mkdir -p /etc/zabbix && \
+    mkdir -p /etc/zabbix/zabbix_agentd.d && \
+    mkdir -p /var/lib/zabbix && \
+    mkdir -p /var/lib/zabbix/enc && \
+    mkdir -p /var/lib/zabbix/modules 
+
+ARG MAJOR_VERSION=5.0
+ARG ZBX_VERSION=${MAJOR_VERSION}.3
+ARG ZBX_SOURCES=https://git.zabbix.com/scm/zbx/zabbix.git
+
+ENV TERM=xterm ZBX_VERSION=${ZBX_VERSION} ZBX_SOURCES=${ZBX_SOURCES}
+
+RUN set -eux && \
+    cd /tmp/ && \
+    git clone ${ZBX_SOURCES} --branch ${ZBX_VERSION} --depth 1 --single-branch zabbix-${ZBX_VERSION} && \
+    cd /tmp/zabbix-${ZBX_VERSION} && \
+    zabbix_revision=`git rev-parse --short HEAD` && \
+    sed -i "s/{ZABBIX_REVISION}/$zabbix_revision/g" include/version.h && \
+    ./bootstrap.sh && \
+    export CFLAGS="-fPIC -pie -Wl,-z,relro -Wl,-z,now" && \
+    ./configure \
+            --datadir=/usr/lib \
+            --libdir=/usr/lib/zabbix \
+            --prefix=/usr \
+            --sysconfdir=/etc/zabbix \
+            --prefix=/usr \
+            --enable-agent \
+            --with-libcurl \
+            --with-ldap \
+            --with-openssl \
+            --enable-ipv6 \
+            --silent && \
+    make -j"$(nproc)" -s && \
+    cp /tmp/zabbix-${ZBX_VERSION}/src/zabbix_sender/zabbix_sender /usr/bin/zabbix_sender && \
+    chmod +x /usr/bin/zabbix_sender
+
+
+RUN cd /tmp/ && \
+    rm -rf /tmp/zabbix-${ZBX_VERSION}/ && \
+    chown --quiet -R zabbix:root /etc/zabbix/ /var/lib/zabbix/ && \
+    chgrp -R 0 /etc/zabbix/ /var/lib/zabbix/ && \
+    chmod -R g=u /etc/zabbix/ /var/lib/zabbix/ && \
+    apk del --purge --no-network \
+            build-dependencies && \
+    rm -rf /var/cache/apk/*
+
 # Run the command on container startup
 ENTRYPOINT ["dumb-init", "--"]
 CMD ["bash", "-c", "/init/init.sh && exec /app/tempsense -z $ZBX_SERVER -n $ZBX_HOSTNAME"]
