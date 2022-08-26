@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
     
     // define base command
     std::string cmd_first_sensor = std::string("echo '- server_rack_temperature[temperature,");
-    std::string cmd_second_sensor = cmd_first_sensor; // just re-use the declaration :>
+    std::string cmd_second_sensor = std::string("echo '- server_rack_temperature[temperature,");
 
     unsigned char buf[65];
     bool first_sensor_read, second_sensor_read = false;
